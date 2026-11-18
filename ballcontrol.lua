@@ -1,23 +1,19 @@
 --[[
 ========================================================
-  BALL CONTROL  v2
+  BALL CONTROL  v3
   repo : supercaptain1233/ballcontrol
   file : ballcontrol.lua
   ------------------------------------------------------
-  v2 changes:
-    - input now reads the control module directly,
-      which is what the thumbstick actually writes to
-    - both balls are moved by position, not velocity,
-      so the game's own physics can't cancel it
-    - the game's AlignPosition / BodyVelocity / gyro
-      constraints are switched off while you have
-      control, and restored when you let go
-    - enemy finder now scans workspace as well, not
-      only player characters
+  v3 changes:
+    - built in joystick. the game hides its own one,
+      so this panel carries its own and reads from it
+    - joystick falls back to the game stick and WASD
+      if you ever want those instead
   ------------------------------------------------------
   TOP BUTTON    = ENEMY CONTROL
   BOTTOM BUTTON = SELF CONTROL
-  Both on = both balls follow the same input.
+  Both on = both balls follow the joystick.
+  The stick drives whichever toggles are on.
   X     = unload and restore everything
   MOVE  = hold and drag the panel
 ========================================================
@@ -52,6 +48,8 @@ S.gui = nil
 S.err = nil
 S.controls = nil
 S.controlsTried = false
+S.stickDir = Vector3.new(0, 0, 0)
+S.stickInput = nil
 
 -- ======================================================
 -- services
@@ -123,10 +121,7 @@ local function setFilter(list)
 end
 
 -- ======================================================
--- input
--- the control module holds the raw stick vector, so
--- read that first. it works for touch and keyboard and
--- it does not care about WalkSpeed.
+-- input, own joystick first, then game stick, then keys
 -- ======================================================
 local function getControls()
   if S.controlsTried then return S.controls end
@@ -142,6 +137,11 @@ local function getControls()
 end
 
 local function readDir()
+  if mag(S.stickDir) > 0.06 then
+    local u = unitXZ(S.stickDir)
+    if u then return u end
+  end
+
   local c = getControls()
   if c then
     local ok, v = pcall(function()
@@ -340,7 +340,6 @@ local function findSelf()
     if b then return b end
   end
 
-  -- ball may live loose in workspace, nearest to us
   local anchor = nil
   local hrp = char and char:FindFirstChild("HumanoidRootPart")
   if hrp then anchor = hrp.Position end
@@ -382,7 +381,6 @@ local function findEnemy()
   local best = nil
   local bestD = 100000
 
-  -- pass one, inside other players
   pcall(function()
     for _, p in ipairs(Players:GetPlayers()) do
       if p ~= LP and p.Character then
@@ -401,7 +399,6 @@ local function findEnemy()
 
   if best then return best end
 
-  -- pass two, loose in workspace, closest to us
   local far = 100000
   for _, d in ipairs(workspace:GetDescendants()) do
     if ballScore(d) >= 60 and d ~= S.selfPart then
@@ -436,7 +433,7 @@ local function floorAt(p)
 end
 
 -- ======================================================
--- movement, position step, vertical axis left alone
+-- movement
 -- ======================================================
 local function stepPart(p, dt, dir)
   local pos = p.Position
@@ -599,7 +596,8 @@ function setEnemy(on)
     S.lastEnemyPos = nil
     S.floorY = nil
     if S.enemyPart then
-      stripForces(ownerOf(S.enemyPart) or S.enemyPart, "enemyForces")
+      stripForces(ownerOf(S.enemyPart) or S.enemyPart,
+        "enemyForces")
     end
   else
     restoreForces("enemyForces")
@@ -709,6 +707,80 @@ local function host()
   return h
 end
 
+-- ======================================================
+-- the joystick
+-- ======================================================
+local function bindStick(pad, knob)
+  local RADIUS = 44
+
+  local function mid()
+    return pad.AbsolutePosition
+      + (pad.AbsoluteSize * 0.5)
+  end
+
+  local function setKnob(dx, dy)
+    knob.Position = UDim2.fromScale(0.5, 0.5)
+      + UDim2.fromOffset(dx, dy)
+  end
+
+  local function update(input)
+    local c = mid()
+    local dx = input.Position.X - c.X
+    local dy = input.Position.Y - c.Y
+    local len = math.sqrt(dx * dx + dy * dy)
+
+    if len > RADIUS then
+      dx = dx / len * RADIUS
+      dy = dy / len * RADIUS
+      len = RADIUS
+    end
+
+    setKnob(dx, dy)
+
+    if len < 5 then
+      S.stickDir = zero()
+      return
+    end
+
+    local nx = dx / len
+    local ny = dy / len
+    local power = math.min(len / RADIUS, 1)
+
+    S.stickDir = Vector3.new(nx, 0, ny) * power
+  end
+
+  track(pad.InputBegan:Connect(function(input)
+    local t = input.UserInputType
+    if t == Enum.UserInputType.MouseButton1
+      or t == Enum.UserInputType.Touch then
+      S.stickInput = input
+      pad.BackgroundColor3 = Color3.fromRGB(52, 62, 80)
+      update(input)
+    end
+  end))
+
+  track(UIS.InputChanged:Connect(function(input)
+    if S.stickInput ~= input then return end
+    update(input)
+  end))
+
+  track(UIS.InputEnded:Connect(function(input)
+    if S.stickInput ~= input then return end
+    S.stickInput = nil
+    S.stickDir = zero()
+    setKnob(0, 0)
+    pad.BackgroundColor3 = Color3.fromRGB(34, 39, 50)
+  end))
+
+  track(pad.InputEnded:Connect(function(input)
+    if S.stickInput ~= input then return end
+    S.stickInput = nil
+    S.stickDir = zero()
+    setKnob(0, 0)
+    pad.BackgroundColor3 = Color3.fromRGB(34, 39, 50)
+  end))
+end
+
 local function buildGui()
   local gui = mk("ScreenGui", {
     Name = "BallControlUI",
@@ -733,7 +805,7 @@ local function buildGui()
     Name = "Panel",
     AnchorPoint = Vector2.new(0.5, 0.5),
     Position = UDim2.fromScale(0.5, 0.5),
-    Size = UDim2.fromOffset(262, 208),
+    Size = UDim2.fromOffset(270, 330),
     BackgroundColor3 = Color3.fromRGB(20, 23, 30),
     BorderSizePixel = 0,
   }, gui)
@@ -800,13 +872,13 @@ local function buildGui()
 
   local enemyBtn = mk("TextButton", {
     Text = "ENEMY CONTROL   [ OFF ]",
-    Position = UDim2.new(0, 16, 0, 42),
-    Size = UDim2.new(1, -32, 0, 52),
+    Position = UDim2.new(0, 16, 0, 40),
+    Size = UDim2.new(1, -32, 0, 46),
     BackgroundColor3 = COL_OFF,
     BorderSizePixel = 0,
     AutoButtonColor = false,
     Font = Enum.Font.GothamBold,
-    TextSize = 13,
+    TextSize = 12,
     TextColor3 = COL_TXT_OFF,
   }, frame)
 
@@ -818,13 +890,13 @@ local function buildGui()
 
   local selfBtn = mk("TextButton", {
     Text = "SELF CONTROL   [ OFF ]",
-    Position = UDim2.new(0, 16, 0, 102),
-    Size = UDim2.new(1, -32, 0, 52),
+    Position = UDim2.new(0, 16, 0, 92),
+    Size = UDim2.new(1, -32, 0, 46),
     BackgroundColor3 = COL_OFF,
     BorderSizePixel = 0,
     AutoButtonColor = false,
     Font = Enum.Font.GothamBold,
-    TextSize = 13,
+    TextSize = 12,
     TextColor3 = COL_TXT_OFF,
   }, frame)
 
@@ -834,9 +906,38 @@ local function buildGui()
     Thickness = 1,
   }, selfBtn)
 
+  -- the joystick pad
+  local pad = mk("TextButton", {
+    Text = "",
+    AnchorPoint = Vector2.new(0.5, 0),
+    Position = UDim2.new(0.5, 0, 0, 146),
+    Size = UDim2.fromOffset(112, 112),
+    BackgroundColor3 = Color3.fromRGB(34, 39, 50),
+    BorderSizePixel = 0,
+    AutoButtonColor = false,
+    ZIndex = 3,
+  }, frame)
+
+  mk("UICorner", { CornerRadius = UDim.new(1, 0) }, pad)
+  mk("UIStroke", {
+    Color = Color3.fromRGB(72, 84, 104),
+    Thickness = 2,
+  }, pad)
+
+  local knob = mk("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(48, 48),
+    BackgroundColor3 = Color3.fromRGB(96, 214, 176),
+    BorderSizePixel = 0,
+    ZIndex = 4,
+  }, pad)
+
+  mk("UICorner", { CornerRadius = UDim.new(1, 0) }, knob)
+
   local status = mk("TextLabel", {
     Text = "both off  -  idle",
-    Position = UDim2.new(0, 16, 0, 162),
+    Position = UDim2.new(0, 16, 0, 266),
     Size = UDim2.new(1, -32, 0, 16),
     BackgroundTransparency = 1,
     Font = Enum.Font.Gotham,
@@ -846,8 +947,8 @@ local function buildGui()
   }, frame)
 
   mk("TextLabel", {
-    Text = "thumbstick or WASD steers",
-    Position = UDim2.new(0, 16, 0, 180),
+    Text = "drag the pad to steer",
+    Position = UDim2.new(0, 16, 0, 284),
     Size = UDim2.new(1, -32, 0, 14),
     BackgroundTransparency = 1,
     Font = Enum.Font.Gotham,
@@ -856,10 +957,25 @@ local function buildGui()
     TextXAlignment = Enum.TextXAlignment.Center,
   }, frame)
 
+  mk("TextLabel", {
+    Text = "hold MOVE to relocate",
+    Position = UDim2.new(0, 16, 0, 300),
+    Size = UDim2.new(1, -32, 0, 14),
+    BackgroundTransparency = 1,
+    Font = Enum.Font.Gotham,
+    TextSize = 9,
+    TextColor3 = Color3.fromRGB(92, 102, 118),
+    TextXAlignment = Enum.TextXAlignment.Center,
+  }, frame)
+
   S.ui.enemy = enemyBtn
   S.ui.self = selfBtn
   S.ui.status = status
   S.ui.panel = frame
+  S.ui.pad = pad
+  S.ui.knob = knob
+
+  bindStick(pad, knob)
 
   track(enemyBtn.MouseButton1Click:Connect(function()
     setEnemy(not S.enemyOn)
@@ -906,106 +1022,3 @@ local function buildGui()
   track(UIS.InputEnded:Connect(function(input)
     local t = input.UserInputType
     if t == Enum.UserInputType.MouseButton1
-      or t == Enum.UserInputType.Touch then
-      if dragging then
-        dragging = false
-        moveBtn.BackgroundColor3 = Color3.fromRGB(46, 54, 68)
-      end
-    end
-  end))
-
-  refreshButtons()
-end
-
--- ======================================================
--- loop
--- ======================================================
-function startLoop()
-  local slow = 0
-
-  track(RunService.Heartbeat:Connect(function(dt)
-    if not S.alive then return end
-
-    slow = slow + dt
-    if slow >= 0.4 then
-      slow = 0
-      guiWatch()
-
-      if S.selfOn
-        and (not S.selfPart or not S.selfPart.Parent) then
-        S.selfPart = findSelf()
-        if S.selfPart then
-          stripForces(S.selfPart.Parent or S.selfPart,
-            "selfForces")
-        end
-        refreshButtons()
-      end
-
-      if S.enemyOn
-        and (not S.enemyPart or not S.enemyPart.Parent) then
-        S.enemyPart = findEnemy()
-        S.lastEnemyPos = nil
-        refreshButtons()
-      end
-
-      if S.enemyPart and S.enemyPart.Parent then
-        S.floorY = floorAt(S.enemyPart)
-      end
-
-      if not S.selfOn then
-        if not S.localPart or not S.localPart.Parent then
-          S.localPart = findSelf()
-        end
-        antiFling()
-      end
-    end
-
-    local step = math.min(dt, 0.05)
-    local dir = readDir()
-
-    if S.selfOn and S.selfPart then
-      driveSelf(step, dir)
-    end
-    if S.enemyOn and S.enemyPart then
-      driveEnemy(step, dir)
-    end
-  end))
-end
-
--- ======================================================
--- boot
--- ======================================================
-function boot()
-  getControls()
-  buildGui()
-  antiAfk()
-  antiKick()
-  startLoop()
-  safe(function() setthreadidentity(7) end)
-end
-
-local ok, err = xpcall(boot, function(e)
-  return tostring(e) .. "\n" .. debug.traceback()
-end)
-
-if not ok then
-  S.err = tostring(err)
-  safe(function() warn("[BallControl] " .. tostring(err)) end)
-  safe(function()
-    local pg = LP:FindFirstChild("PlayerGui")
-    if not pg then return end
-    local box = Instance.new("TextLabel")
-    box.Size = UDim2.fromOffset(300, 90)
-    box.Position = UDim2.new(0.5, -150, 0, 60)
-    box.BackgroundColor3 = Color3.fromRGB(30, 16, 16)
-    box.TextColor3 = Color3.fromRGB(255, 190, 190)
-    box.Font = Enum.Font.Code
-    box.TextSize = 10
-    box.TextWrapped = true
-    box.Text = "BOOT ERROR\n" .. tostring(err)
-    box.Parent = pg
-    task.delay(14, function()
-      safe(function() box:Destroy() end)
-    end)
-  end)
-end
