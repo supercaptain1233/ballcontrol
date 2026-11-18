@@ -1,31 +1,31 @@
 --[[
 ========================================================
-  BALL CONTROL
+  BALL CONTROL  v2
   repo : supercaptain1233/ballcontrol
   file : ballcontrol.lua
   ------------------------------------------------------
-  For ball vs ball 1v1 games.
+  v2 changes:
+    - input now reads the control module directly,
+      which is what the thumbstick actually writes to
+    - both balls are moved by position, not velocity,
+      so the game's own physics can't cancel it
+    - the game's AlignPosition / BodyVelocity / gyro
+      constraints are switched off while you have
+      control, and restored when you let go
+    - enemy finder now scans workspace as well, not
+      only player characters
   ------------------------------------------------------
   TOP BUTTON    = ENEMY CONTROL
-    while on, your thumbstick / WASD drives the
-    enemy ball. it follows your input anywhere.
   BOTTOM BUTTON = SELF CONTROL
-    while on, your own ball follows your input
-    instead of the game moving it.
-  ------------------------------------------------------
   Both on = both balls follow the same input.
-  Toggle either one before the match. It stays
-  armed and hooks the balls the moment they spawn.
-  ------------------------------------------------------
-  X     = unload everything and restore all parts
-  MOVE  = hold it and drag the panel anywhere
+  X     = unload and restore everything
+  MOVE  = hold and drag the panel
 ========================================================
 ]]
 
 local RAW = "https://raw.githubusercontent.com/"
   .. "supercaptain1233/ballcontrol/main/ballcontrol.lua"
 
--- one instance only, kill the old one first
 pcall(function()
   local old = getgenv().BallControl
   if old and old.destroy then old.destroy() end
@@ -47,14 +47,14 @@ S.floorY = nil
 S.lastEnemyPos = nil
 S.saved = {}
 S.ui = {}
-S.speed = 70
-S.scanAcc = 0
+S.speed = 68
 S.gui = nil
 S.err = nil
+S.controls = nil
+S.controlsTried = false
 
 -- ======================================================
--- services, every one wrapped so one failure can't
--- take the whole boot down
+-- services
 -- ======================================================
 local function svc(name)
   local ok, s = pcall(function()
@@ -67,7 +67,6 @@ end
 local Players = svc("Players")
 local RunService = svc("RunService")
 local UIS = svc("UserInputService")
-local TweenService = svc("TweenService")
 local VirtualUser = svc("VirtualUser")
 
 local LP = Players and Players.LocalPlayer
@@ -78,19 +77,13 @@ if not LP then
 end
 
 -- ======================================================
--- small utilities
+-- utilities
 -- ======================================================
 local function track(c)
   if c then
     S.conns[#S.conns + 1] = c
   end
   return c
-end
-
-local function clamp(v, lo, hi)
-  if v < lo then return lo end
-  if v > hi then return hi end
-  return v
 end
 
 local function safe(fn, ...)
@@ -101,10 +94,6 @@ end
 
 local function zero()
   return Vector3.new(0, 0, 0)
-end
-
-local function flat(v)
-  return Vector3.new(v.X, 0, v.Z)
 end
 
 local function mag(v)
@@ -118,7 +107,7 @@ local function unitXZ(v)
 end
 
 -- ======================================================
--- raycast setup for the floor probe
+-- raycast setup
 -- ======================================================
 local rp = RaycastParams.new()
 rp.IgnoreWater = true
@@ -134,10 +123,137 @@ local function setFilter(list)
 end
 
 -- ======================================================
+-- input
+-- the control module holds the raw stick vector, so
+-- read that first. it works for touch and keyboard and
+-- it does not care about WalkSpeed.
+-- ======================================================
+local function getControls()
+  if S.controlsTried then return S.controls end
+  S.controlsTried = true
+  safe(function()
+    local ps = LP:FindFirstChild("PlayerScripts")
+    local pm = ps and ps:FindFirstChild("PlayerModule")
+    if not pm then return end
+    local mod = require(pm)
+    S.controls = mod:GetControls()
+  end)
+  return S.controls
+end
+
+local function readDir()
+  local c = getControls()
+  if c then
+    local ok, v = pcall(function()
+      return c:GetMoveVector()
+    end)
+    if ok and v then
+      local u = unitXZ(v)
+      if u then return u end
+    end
+  end
+
+  local char = LP.Character
+  if char then
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum then
+      local u = unitXZ(hum.MoveDirection)
+      if u then return u end
+    end
+  end
+
+  if not UIS then return zero() end
+
+  local x, z = 0, 0
+  if UIS:IsKeyDown(Enum.KeyCode.W) then z = z - 1 end
+  if UIS:IsKeyDown(Enum.KeyCode.S) then z = z + 1 end
+  if UIS:IsKeyDown(Enum.KeyCode.A) then x = x - 1 end
+  if UIS:IsKeyDown(Enum.KeyCode.D) then x = x + 1 end
+
+  local u = unitXZ(Vector3.new(x, 0, z))
+  if u then return u end
+  return zero()
+end
+
+-- ======================================================
+-- constraint suppression
+-- ======================================================
+local KILL = {
+  "AlignPosition", "AlignOrientation", "AlignConstraint",
+  "BodyVelocity", "BodyGyro", "BodyAngularVelocity",
+  "BodyPosition", "LinearVelocity", "AngularVelocity",
+  "BodyForce", "VectorForce",
+}
+
+function stripForces(root, key)
+  S.saved[key] = {}
+  if not root then return end
+
+  local list = safe(function()
+    return root:GetDescendants()
+  end) or {}
+
+  for _, d in ipairs(list) do
+    for _, cls in ipairs(KILL) do
+      if d:IsA(cls) then
+        local rec = { inst = d }
+
+        local okE = pcall(function()
+          rec.enabled = d.Enabled
+          rec.prop = "Enabled"
+          d.Enabled = false
+        end)
+
+        if not okE then
+          local okM = pcall(function()
+            local mf = d.MaxForce
+            rec.mf = mf
+            rec.prop = "MaxForce"
+            if typeof(mf) == "Vector3" then
+              d.MaxForce = zero()
+            else
+              d.MaxForce = 0
+            end
+          end)
+
+          if not okM then
+            pcall(function()
+              rec.mf = d.Force
+              rec.prop = "Force"
+              d.Force = zero()
+            end)
+          end
+        end
+
+        if rec.prop then
+          S.saved[key][#S.saved[key] + 1] = rec
+        end
+
+        break
+      end
+    end
+  end
+end
+
+function restoreForces(key)
+  local recs = S.saved[key]
+  if not recs then return end
+
+  for _, rec in ipairs(recs) do
+    safe(function()
+      if rec.mf ~= nil then
+        rec.inst[rec.prop] = rec.mf
+      else
+        rec.inst[rec.prop] = rec.enabled
+      end
+    end)
+  end
+
+  S.saved[key] = nil
+end
+
+-- ======================================================
 -- ball recognition
--- balls in these games are small unanchored spheres.
--- we score candidates so the real ball always wins
--- over random scenery and over the root part.
 -- ======================================================
 local NAME_HITS = { "ball", "orb", "sphere", "marble" }
 
@@ -152,42 +268,38 @@ local function ballScore(p)
   local mx = math.max(sz.X, sz.Y, sz.Z)
   local mn = math.min(sz.X, sz.Y, sz.Z)
 
-  if mx > 22 then return 0 end
-  if mn < 0.4 then return 0 end
+  if mx > 26 then return 0 end
+  if mn < 0.3 then return 0 end
 
   local n = string.lower(p.Name)
   local sc = 10
 
   for _, k in ipairs(NAME_HITS) do
     if string.find(n, k, 1, true) then
-      sc = sc + 80
+      sc = sc + 90
       break
     end
   end
 
-  -- a ball is roughly round, reward that shape
   local ratio = mn / mx
-  if ratio > 0.75 then
-    sc = sc + 45
-  elseif ratio > 0.5 then
-    sc = sc + 20
+  if ratio > 0.72 then
+    sc = sc + 40
+  elseif ratio > 0.45 then
+    sc = sc + 15
   end
 
-  if p.CanCollide then sc = sc + 12 end
-
-  if string.find(n, "root", 1, true) then sc = sc - 30 end
-  if string.find(n, "head", 1, true) then sc = sc - 22 end
-  if string.find(n, "handle", 1, true) then sc = sc - 12 end
+  if string.find(n, "root", 1, true) then sc = sc - 35 end
+  if string.find(n, "head", 1, true) then sc = sc - 25 end
   if string.find(n, "torso", 1, true) then sc = sc - 25 end
+  if string.find(n, "handle", 1, true) then sc = sc - 12 end
   if string.find(n, "arm", 1, true) then sc = sc - 15 end
   if string.find(n, "leg", 1, true) then sc = sc - 15 end
-  if string.find(n, "effect", 1, true) then sc = sc - 10 end
   if string.find(n, "trail", 1, true) then sc = sc - 18 end
+  if string.find(n, "effect", 1, true) then sc = sc - 10 end
 
   return sc
 end
 
--- best scored part anywhere inside one model
 local function bestIn(model)
   if not model then return nil end
   local best = nil
@@ -196,7 +308,6 @@ local function bestIn(model)
   local list = safe(function()
     return model:GetDescendants()
   end)
-
   if not list then return nil end
 
   for _, d in ipairs(list) do
@@ -207,23 +318,55 @@ local function bestIn(model)
     end
   end
 
-  if bestScore < 20 then return nil end
+  if bestScore < 25 then return nil end
   return best
 end
 
 -- ======================================================
 -- finders
 -- ======================================================
+local function ownerOf(part)
+  local m = part
+  while m and m.Parent and m.Parent ~= workspace do
+    m = m.Parent
+  end
+  return m
+end
+
 local function findSelf()
   local char = LP.Character
-  if not char then return nil end
-  local b = bestIn(char)
-  if b then return b end
+  if char then
+    local b = bestIn(char)
+    if b then return b end
+  end
 
-  -- fallback: the humanoid root, if nothing scored
-  local hrp = char:FindFirstChild("HumanoidRootPart")
-  if hrp and not hrp.Anchored then return hrp end
-  return nil
+  -- ball may live loose in workspace, nearest to us
+  local anchor = nil
+  local hrp = char and char:FindFirstChild("HumanoidRootPart")
+  if hrp then anchor = hrp.Position end
+
+  local best = nil
+  local bestD = 22
+
+  for _, d in ipairs(workspace:GetDescendants()) do
+    local sc = ballScore(d)
+    if sc >= 60 then
+      local own = ownerOf(d)
+      local isOurs = char and own and own:IsDescendantOf(char)
+      if not isOurs then
+        local dist = 0
+        if anchor then
+          dist = (d.Position - anchor).Magnitude
+        end
+        if dist < bestD then
+          best = d
+          bestD = dist
+        end
+      end
+    end
+  end
+
+  return best
 end
 
 local function findEnemy()
@@ -239,15 +382,14 @@ local function findEnemy()
   local best = nil
   local bestD = 100000
 
-  local ok = pcall(function()
+  -- pass one, inside other players
+  pcall(function()
     for _, p in ipairs(Players:GetPlayers()) do
       if p ~= LP and p.Character then
         local b = bestIn(p.Character)
         if b then
           local d = 0
-          if anchor then
-            d = (b.Position - anchor).Magnitude
-          end
+          if anchor then d = (b.Position - anchor).Magnitude end
           if d < bestD then
             best = b
             bestD = d
@@ -257,108 +399,49 @@ local function findEnemy()
     end
   end)
 
-  if not ok then return nil end
+  if best then return best end
+
+  -- pass two, loose in workspace, closest to us
+  local far = 100000
+  for _, d in ipairs(workspace:GetDescendants()) do
+    if ballScore(d) >= 60 and d ~= S.selfPart then
+      local d2 = 0
+      if anchor then d2 = (d.Position - anchor).Magnitude end
+      if d2 < far then
+        best = d
+        far = d2
+      end
+    end
+  end
+
   return best
 end
 
 -- ======================================================
--- floor probe, only used to stop the enemy ball
--- sinking under the arena
+-- floor probe
 -- ======================================================
 local function floorAt(p)
   if not p or not p.Parent then return nil end
   setFilter({ p, LP.Character })
 
-  local from = p.Position + Vector3.new(0, 4, 0)
-  local down = Vector3.new(0, -16, 0)
+  local from = p.Position + Vector3.new(0, 5, 0)
   local res = safe(function()
-    return workspace:Raycast(from, down, rp)
+    return workspace:Raycast(from, Vector3.new(0, -18, 0), rp)
   end)
 
   if res and res.Position then
-    return res.Position.Y + (p.Size.Y * 0.5) + 0.12
+    return res.Position.Y + (p.Size.Y * 0.5) + 0.1
   end
   return nil
 end
 
 -- ======================================================
--- input reader
--- thumbstick first, keyboard second
+-- movement, position step, vertical axis left alone
 -- ======================================================
-local function readDir()
-  local char = LP.Character
-  if char then
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if hum then
-      local md = hum.MoveDirection
-      local u = unitXZ(md)
-      if u then return u end
-    end
-  end
-
-  if not UIS then return zero() end
-
-  local x, z = 0, 0
-  if UIS:IsKeyDown(Enum.KeyCode.W) then z = z - 1 end
-  if UIS:IsKeyDown(Enum.KeyCode.S) then z = z + 1 end
-  if UIS:IsKeyDown(Enum.KeyCode.A) then x = x - 1 end
-  if UIS:IsKeyDown(Enum.KeyCode.D) then x = x + 1 end
-
-  local v = Vector3.new(x, 0, z)
-  local u = unitXZ(v)
-  if u then return u end
-  return zero()
-end
-
--- ======================================================
--- drive the self ball
--- pure velocity, Y untouched so it still bounces
--- ======================================================
-local function driveSelf(dt, dir)
-  local p = S.selfPart
-  if not p or not p.Parent then return end
-
-  local v = safe(function()
-    return p.AssemblyLinearVelocity
-  end) or zero()
-
-  local target = dir * S.speed
-
-  safe(function()
-    p.AssemblyLinearVelocity =
-      Vector3.new(target.X, v.Y, target.Z)
-  end)
-
-  safe(function()
-    p.AssemblyAngularVelocity = zero()
-  end)
-end
-
--- ======================================================
--- drive the enemy ball
--- position stepping, because we don't own it
--- ======================================================
-local function driveEnemy(dt, dir)
-  local p = S.enemyPart
-  if not p or not p.Parent then return end
-
+local function stepPart(p, dt, dir)
   local pos = p.Position
   local target = dir * S.speed
-  local step = target * dt
-  local nextPos = pos + step
-
-  -- if the game yanks it away, rebuild from last good
-  if S.lastEnemyPos then
-    local jump = (pos - S.lastEnemyPos).Magnitude
-    if jump > 45 then
-      nextPos = S.lastEnemyPos + step
-    end
-  end
-
-  -- keep it above the floor
-  if S.floorY and nextPos.Y < (S.floorY - 0.6) then
-    nextPos = Vector3.new(nextPos.X, S.floorY, nextPos.Z)
-  end
+  local nextPos = pos + target * dt
 
   local rot = safe(function()
     return p.CFrame.Rotation
@@ -374,7 +457,6 @@ local function driveEnemy(dt, dir)
     end)
   end
 
-  -- kill its own horizontal drift, keep gravity
   local v = safe(function()
     return p.AssemblyLinearVelocity
   end) or zero()
@@ -382,6 +464,42 @@ local function driveEnemy(dt, dir)
   safe(function()
     p.AssemblyLinearVelocity = Vector3.new(0, v.Y, 0)
   end)
+  safe(function()
+    p.AssemblyAngularVelocity = zero()
+  end)
+
+  return nextPos
+end
+
+local function driveSelf(dt, dir)
+  local p = S.selfPart
+  if not p or not p.Parent then return end
+  stepPart(p, dt, dir)
+end
+
+local function driveEnemy(dt, dir)
+  local p = S.enemyPart
+  if not p or not p.Parent then return end
+
+  if S.lastEnemyPos then
+    local jump = (p.Position - S.lastEnemyPos).Magnitude
+    if jump > 45 then
+      safe(function()
+        p.CFrame = CFrame.new(S.lastEnemyPos)
+      end)
+    end
+  end
+
+  local nextPos = stepPart(p, dt, dir)
+
+  if S.floorY and nextPos.Y < (S.floorY - 0.8) then
+    safe(function()
+      p.CFrame = CFrame.new(
+        Vector3.new(nextPos.X, S.floorY, nextPos.Z)
+      ) * p.CFrame.Rotation
+    end)
+    nextPos = Vector3.new(nextPos.X, S.floorY, nextPos.Z)
+  end
 
   S.lastEnemyPos = nextPos
 end
@@ -405,50 +523,65 @@ function refreshButtons()
   paint(S.ui.enemy, S.enemyOn, "ENEMY CONTROL")
   paint(S.ui.self, S.selfOn, "SELF CONTROL")
 
-  if S.ui.status then
-    if S.enemyOn or S.selfOn then
-      local e = S.enemyPart and "LOCKED" or "SEARCHING"
-      local s = S.selfPart and "LOCKED" or "SEARCHING"
-      S.ui.status.Text = "enemy " .. e .. "  /  self " .. s
-      S.ui.status.TextColor3 = Color3.fromRGB(150, 235, 200)
-    else
-      S.ui.status.Text = "both off  -  idle"
-      S.ui.status.TextColor3 = Color3.fromRGB(140, 150, 165)
-    end
+  if not S.ui.status then return end
+
+  if S.enemyOn or S.selfOn then
+    local e = S.enemyPart and "OK" or "no ball"
+    local s = S.selfPart and "OK" or "no ball"
+    S.ui.status.Text = "enemy " .. e .. "  /  self " .. s
+    S.ui.status.TextColor3 = Color3.fromRGB(150, 235, 200)
+  else
+    S.ui.status.Text = "both off  -  idle"
+    S.ui.status.TextColor3 = Color3.fromRGB(140, 150, 165)
   end
 end
 
 -- ======================================================
--- self control on / off
+-- toggles
 -- ======================================================
 function setSelf(on)
   S.selfOn = on and true or false
+  S.saved.selfForces = nil
 
   if S.selfOn then
     S.selfPart = findSelf()
-    if S.selfPart then
-      S.saved.selfCollide = S.selfPart.CanCollide
-      local char = S.selfPart.Parent
+    local p = S.selfPart
+    if p then
+      S.saved.selfCollide = p.CanCollide
+      local char = p.Parent
       local hum = char and char:FindFirstChildOfClass("Humanoid")
       if hum then
         S.saved.walk = hum.WalkSpeed
+        S.saved.autoRotate = hum.AutoRotate
         safe(function() hum.WalkSpeed = 0 end)
+        safe(function() hum.AutoRotate = false end)
       end
+      stripForces(char or p, "selfForces")
+      safe(function() p.AssemblyLinearVelocity = zero() end)
     end
   else
-    if S.selfPart then
+    local p = S.selfPart
+    if p then
+      restoreForces("selfForces")
       if S.saved.selfCollide ~= nil then
         safe(function()
-          S.selfPart.CanCollide = S.saved.selfCollide
+          p.CanCollide = S.saved.selfCollide
         end)
       end
-      local char = S.selfPart.Parent
+      local char = p.Parent
       local hum = char and char:FindFirstChildOfClass("Humanoid")
-      if hum and S.saved.walk then
-        safe(function() hum.WalkSpeed = S.saved.walk end)
+      if hum then
+        if S.saved.walk then
+          safe(function() hum.WalkSpeed = S.saved.walk end)
+        end
+        if S.saved.autoRotate ~= nil then
+          safe(function()
+            hum.AutoRotate = S.saved.autoRotate
+          end)
+        end
       end
       safe(function()
-        S.selfPart.AssemblyAngularVelocity = zero()
+        p.AssemblyAngularVelocity = zero()
       end)
     end
     S.selfPart = nil
@@ -457,17 +590,19 @@ function setSelf(on)
   refreshButtons()
 end
 
--- ======================================================
--- enemy control on / off
--- ======================================================
 function setEnemy(on)
   S.enemyOn = on and true or false
+  S.saved.enemyForces = nil
 
   if S.enemyOn then
     S.enemyPart = findEnemy()
     S.lastEnemyPos = nil
     S.floorY = nil
+    if S.enemyPart then
+      stripForces(ownerOf(S.enemyPart) or S.enemyPart, "enemyForces")
+    end
   else
+    restoreForces("enemyForces")
     if S.enemyPart and S.enemyPart.Parent then
       safe(function()
         S.enemyPart.AssemblyAngularVelocity = zero()
@@ -482,10 +617,8 @@ function setEnemy(on)
 end
 
 -- ======================================================
--- protection layer
+-- protection
 -- ======================================================
-
--- keep the session from timing out and dropping you
 function antiAfk()
   track(LP.Idled:Connect(function()
     safe(function()
@@ -495,18 +628,14 @@ function antiAfk()
   end))
 end
 
--- re-run the script after a teleport so a kick
--- or a lobby shuffle doesn't leave you with nothing
 function antiKick()
   safe(function()
-    local line = ("loadstring(game:HttpGet('%s'))()")
-      :format(RAW)
-    queue_on_teleport(line)
+    queue_on_teleport(
+      ("loadstring(game:HttpGet('%s'))()"):format(RAW)
+    )
   end)
 end
 
--- if the game flings your ball across the map while
--- self control is off, drag the speed back down
 function antiFling()
   local p = S.localPart
   if not p or not p.Parent then return end
@@ -516,18 +645,17 @@ function antiFling()
   end)
   if not v then return end
 
-  if v.Magnitude > 420 then
+  if v.Magnitude > 450 then
     local u = unitXZ(v)
     if u then
       safe(function()
         p.AssemblyLinearVelocity =
-          Vector3.new(u.X * 420, v.Y, u.Z * 420)
+          Vector3.new(u.X * 450, v.Y, u.Z * 450)
       end)
     end
   end
 end
 
--- if the panel gets deleted by the game, rebuild
 function guiWatch()
   if not S.gui then return end
   if S.gui.Parent then return end
@@ -550,7 +678,6 @@ S.destroy = function()
   S.conns = {}
 
   safe(function() if S.gui then S.gui:Destroy() end end)
-
   safe(function()
     if getgenv().BallControl == S then
       getgenv().BallControl = nil
@@ -578,9 +705,6 @@ local function host()
   end
   if not h then
     h = LP:FindFirstChild("PlayerGui")
-    if not h then
-      h = LP:WaitForChild("PlayerGui", 6)
-    end
   end
   return h
 end
@@ -614,16 +738,12 @@ local function buildGui()
     BorderSizePixel = 0,
   }, gui)
 
-  mk("UICorner", {
-    CornerRadius = UDim.new(0, 12),
-  }, frame)
-
+  mk("UICorner", { CornerRadius = UDim.new(0, 12) }, frame)
   mk("UIStroke", {
     Color = Color3.fromRGB(58, 68, 86),
     Thickness = 1.5,
   }, frame)
 
-  -- title strip
   local bar = mk("Frame", {
     Name = "Bar",
     Size = UDim2.new(1, 0, 0, 30),
@@ -631,10 +751,7 @@ local function buildGui()
     BorderSizePixel = 0,
   }, frame)
 
-  mk("UICorner", {
-    CornerRadius = UDim.new(0, 12),
-  }, bar)
-
+  mk("UICorner", { CornerRadius = UDim.new(0, 12) }, bar)
   mk("Frame", {
     Size = UDim2.new(1, 0, 0, 14),
     Position = UDim2.new(0, 0, 1, -14),
@@ -681,7 +798,6 @@ local function buildGui()
 
   mk("UICorner", { CornerRadius = UDim.new(0, 6) }, closeBtn)
 
-  -- the two control buttons
   local enemyBtn = mk("TextButton", {
     Text = "ENEMY CONTROL   [ OFF ]",
     Position = UDim2.new(0, 16, 0, 42),
@@ -729,7 +845,7 @@ local function buildGui()
     TextXAlignment = Enum.TextXAlignment.Center,
   }, frame)
 
-  local foot = mk("TextLabel", {
+  mk("TextLabel", {
     Text = "thumbstick or WASD steers",
     Position = UDim2.new(0, 16, 0, 180),
     Size = UDim2.new(1, -32, 0, 14),
@@ -745,7 +861,6 @@ local function buildGui()
   S.ui.status = status
   S.ui.panel = frame
 
-  -- wiring
   track(enemyBtn.MouseButton1Click:Connect(function()
     setEnemy(not S.enemyOn)
   end))
@@ -758,14 +873,14 @@ local function buildGui()
     S.destroy()
   end))
 
-  -- drag
   local dragging = false
   local dragStart = nil
   local startPos = nil
 
   track(moveBtn.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-      or input.UserInputType == Enum.UserInputType.Touch then
+    local t = input.UserInputType
+    if t == Enum.UserInputType.MouseButton1
+      or t == Enum.UserInputType.Touch then
       dragging = true
       dragStart = input.Position
       startPos = frame.Position
@@ -775,8 +890,9 @@ local function buildGui()
 
   track(UIS.InputChanged:Connect(function(input)
     if not dragging then return end
-    if input.UserInputType == Enum.UserInputType.MouseMovement
-      or input.UserInputType == Enum.UserInputType.Touch then
+    local t = input.UserInputType
+    if t == Enum.UserInputType.MouseMovement
+      or t == Enum.UserInputType.Touch then
       local d = input.Position - dragStart
       frame.Position = UDim2.new(
         startPos.X.Scale,
@@ -788,8 +904,9 @@ local function buildGui()
   end))
 
   track(UIS.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-      or input.UserInputType == Enum.UserInputType.Touch then
+    local t = input.UserInputType
+    if t == Enum.UserInputType.MouseButton1
+      or t == Enum.UserInputType.Touch then
       if dragging then
         dragging = false
         moveBtn.BackgroundColor3 = Color3.fromRGB(46, 54, 68)
@@ -801,7 +918,7 @@ local function buildGui()
 end
 
 -- ======================================================
--- main loop
+-- loop
 -- ======================================================
 function startLoop()
   local slow = 0
@@ -814,9 +931,13 @@ function startLoop()
       slow = 0
       guiWatch()
 
-      -- keep targets hooked, rescan if they vanished
-      if S.selfOn and (not S.selfPart or not S.selfPart.Parent) then
+      if S.selfOn
+        and (not S.selfPart or not S.selfPart.Parent) then
         S.selfPart = findSelf()
+        if S.selfPart then
+          stripForces(S.selfPart.Parent or S.selfPart,
+            "selfForces")
+        end
         refreshButtons()
       end
 
@@ -831,7 +952,6 @@ function startLoop()
         S.floorY = floorAt(S.enemyPart)
       end
 
-      -- anti fling only while the game is steering
       if not S.selfOn then
         if not S.localPart or not S.localPart.Parent then
           S.localPart = findSelf()
@@ -842,13 +962,11 @@ function startLoop()
 
     local step = math.min(dt, 0.05)
     local dir = readDir()
-    local moving = mag(dir) > 0.05
 
-    if S.selfOn and S.selfPart and moving then
+    if S.selfOn and S.selfPart then
       driveSelf(step, dir)
     end
-
-    if S.enemyOn and S.enemyPart and moving then
+    if S.enemyOn and S.enemyPart then
       driveEnemy(step, dir)
     end
   end))
@@ -858,14 +976,12 @@ end
 -- boot
 -- ======================================================
 function boot()
+  getControls()
   buildGui()
   antiAfk()
   antiKick()
   startLoop()
-
-  safe(function()
-    setthreadidentity(7)
-  end)
+  safe(function() setthreadidentity(7) end)
 end
 
 local ok, err = xpcall(boot, function(e)
@@ -874,11 +990,7 @@ end)
 
 if not ok then
   S.err = tostring(err)
-  safe(function()
-    warn("[BallControl] " .. tostring(err))
-  end)
-
-  -- visible failure so a dead panel is diagnosable
+  safe(function() warn("[BallControl] " .. tostring(err)) end)
   safe(function()
     local pg = LP:FindFirstChild("PlayerGui")
     if not pg then return end
